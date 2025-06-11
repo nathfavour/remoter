@@ -77,11 +77,59 @@ func startX11vnc(display string) error {
 	return exec.Command("x11vnc", "-display", display, "-forever").Start()
 }
 
-func startXFCE(display string) error {
-	fmt.Println("Starting XFCE desktop environment...")
-	cmd := exec.Command("startxfce4")
-	cmd.Env = append(os.Environ(), "DISPLAY="+display)
-	return cmd.Start()
+func startDesktop(display string) error {
+	fmt.Println("Starting desktop environment...")
+
+	// Create a profile script that sets DISPLAY permanently for the session
+	profileScript := `export DISPLAY=` + display + `
+export XAUTHORITY=/tmp/.X` + display[1:] + `-auth
+`
+	profilePath := "/tmp/vnc_profile"
+	if err := os.WriteFile(profilePath, []byte(profileScript), 0644); err != nil {
+		return err
+	}
+
+	// Create a wrapper script for xterm that sources the profile
+	xtermScript := `#!/bin/bash
+source /tmp/vnc_profile
+exec xterm -e "bash --rcfile /tmp/vnc_profile"
+`
+	xtermPath := "/tmp/vnc_xterm.sh"
+	if err := os.WriteFile(xtermPath, []byte(xtermScript), 0755); err != nil {
+		return err
+	}
+
+	// Start window manager (openbox) with proper environment
+	cmd1 := exec.Command("openbox")
+	cmd1.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := cmd1.Start(); err != nil {
+		return err
+	}
+
+	time.Sleep(1 * time.Second)
+
+	// Start file manager
+	cmd2 := exec.Command("pcmanfm", "--desktop")
+	cmd2.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := cmd2.Start(); err != nil {
+		fmt.Printf("Warning: Failed to start file manager: %v\n", err)
+	}
+
+	// Start panel (tint2) for taskbar and app launcher
+	cmd3 := exec.Command("tint2")
+	cmd3.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := cmd3.Start(); err != nil {
+		fmt.Printf("Warning: Failed to start panel: %v\n", err)
+	}
+
+	// Start a terminal with the wrapper script that sets DISPLAY permanently
+	cmd4 := exec.Command(xtermPath)
+	cmd4.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := cmd4.Start(); err != nil {
+		fmt.Printf("Warning: Failed to start terminal: %v\n", err)
+	}
+
+	return nil
 }
 
 func main() {
@@ -94,7 +142,7 @@ func main() {
 	startIPBroadcastServer(ip, port)
 
 	// Ensure dependencies
-	for _, pkg := range []string{"x11vnc", "xvfb", "xfce4"} {
+	for _, pkg := range []string{"x11vnc", "xvfb", "openbox", "pcmanfm", "xterm", "tint2"} {
 		if err := ensureInstalled(pkg); err != nil {
 			log.Fatalf("Failed to install %s: %v", pkg, err)
 		}
@@ -106,11 +154,11 @@ func main() {
 	}
 	time.Sleep(2 * time.Second) // Give Xvfb time to initialize
 
-	// Start XFCE desktop environment
-	if err := startXFCE(display); err != nil {
-		log.Fatalf("Failed to start XFCE: %v", err)
+	// Start desktop environment
+	if err := startDesktop(display); err != nil {
+		log.Fatalf("Failed to start desktop: %v", err)
 	}
-	time.Sleep(2 * time.Second) // Give XFCE time to initialize
+	time.Sleep(2 * time.Second) // Give desktop time to initialize
 
 	// Start x11vnc
 	if err := startX11vnc(display); err != nil {
