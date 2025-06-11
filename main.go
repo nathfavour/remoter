@@ -41,8 +41,12 @@ func startIPBroadcastServer(ip string, port string) {
 		fmt.Fprintf(w, "<h1>Device IP: %s</h1>", ip)
 	})
 	go func() {
-		log.Printf("Broadcasting IP at http://0.0.0.0:%s/", port)
-		log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
+		addr := "0.0.0.0:" + port
+		log.Printf("Broadcasting IP at http://%s/", addr)
+		err := http.ListenAndServe(addr, nil)
+		if err != nil {
+			log.Fatalf("Failed to start IP broadcast server on port %s: %v\nTry running with sudo or choose a higher port (e.g., 8080, 4246).", port, err)
+		}
 	}()
 }
 
@@ -74,7 +78,7 @@ func startX11vnc(display string) error {
 
 func main() {
 	ip := getPrimaryIP()
-	port := "246"
+	port := "8642" // Changed from 246 to 4246
 	display := ":1"
 	res := "1920x1080x24"
 
