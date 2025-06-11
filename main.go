@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"time"
 )
 
 func getPrimaryIP() string {
@@ -76,9 +77,16 @@ func startX11vnc(display string) error {
 	return exec.Command("x11vnc", "-display", display, "-forever").Start()
 }
 
+func startXFCE(display string) error {
+	fmt.Println("Starting XFCE desktop environment...")
+	cmd := exec.Command("startxfce4")
+	cmd.Env = append(os.Environ(), "DISPLAY="+display)
+	return cmd.Start()
+}
+
 func main() {
 	ip := getPrimaryIP()
-	port := "8642" // Changed from 246 to 4246
+	port := "8642"
 	display := ":1"
 	res := "1920x1080x24"
 
@@ -86,16 +94,25 @@ func main() {
 	startIPBroadcastServer(ip, port)
 
 	// Ensure dependencies
-	for _, pkg := range []string{"x11vnc", "xvfb"} {
+	for _, pkg := range []string{"x11vnc", "xvfb", "xfce4"} {
 		if err := ensureInstalled(pkg); err != nil {
 			log.Fatalf("Failed to install %s: %v", pkg, err)
 		}
 	}
 
-	// Start Xvfb and x11vnc
+	// Start Xvfb
 	if err := startXvfb(display, res); err != nil {
 		log.Fatalf("Failed to start Xvfb: %v", err)
 	}
+	time.Sleep(2 * time.Second) // Give Xvfb time to initialize
+
+	// Start XFCE desktop environment
+	if err := startXFCE(display); err != nil {
+		log.Fatalf("Failed to start XFCE: %v", err)
+	}
+	time.Sleep(2 * time.Second) // Give XFCE time to initialize
+
+	// Start x11vnc
 	if err := startX11vnc(display); err != nil {
 		log.Fatalf("Failed to start x11vnc: %v", err)
 	}
