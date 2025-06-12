@@ -4,165 +4,226 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
-	"time"
+	"sync"
 
+	"github.com/gorilla/websocket"
 	"github.com/nathfavour/remoter/ffmpeg"
 	"github.com/nathfavour/remoter/vnc"
 )
 
 type Config struct {
-	Mode    string `json:"mode"`    // "vnc" or "ffmpeg"
-	Display string `json:"display"` // e.g. ":1"
-	Res     string `json:"res"`     // e.g. "1920x1080x24"
+	VNC     bool   `json:"vnc"`
+	FFmpeg  bool   `json:"ffmpeg"`
+	Display string `json:"display"` // Set to ":0.0", ":1", etc. in ~/.remoter.json
+	Res     string `json:"res"`
+	Port    int    `json:"port"`
 }
 
-func getPrimaryIP() string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "unknown"
+func defaultConfig() *Config {
+	return &Config{
+		VNC:     false,
+		FFmpeg:  true,
+		Display: ":0.0", // Use real display instead of virtual
+		Res:     "1920x1080x24",
+		Port:    8081,
 	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-				continue
-			}
-			return ip.String()
-		}
-	}
-	return "unknown"
 }
 
-func startIPBroadcastServer(ip string, port string) {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "<h1>Device IP: %s</h1>", ip)
-	})
-	go func() {
-		addr := "0.0.0.0:" + port
-		log.Printf("Broadcasting IP at http://%s/", addr)
-		err := http.ListenAndServe(addr, nil)
-		if err != nil {
-			log.Fatalf("Failed to start IP broadcast server on port %s: %v\nTry running with sudo or choose a higher port (e.g., 8080, 4246).", port, err)
-		}
-	}()
-}
-
-func loadConfig() (*Config, error) {
+func configPath() (string, error) {
 	usr, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(usr.HomeDir, ".remoter.json"), nil
+}
+
+func loadOrCreateConfig() (*Config, error) {
+	path, err := configPath()
 	if err != nil {
 		return nil, err
 	}
-	configPath := filepath.Join(usr.HomeDir, ".remoter.json")
-	f, err := os.Open(configPath)
+	f, err := os.Open(path)
 	if err != nil {
-		// Create default config if not exists
-		defaultCfg := &Config{
-			Mode:    "vnc",
-			Display: ":1",
-			Res:     "1920x1080x24",
-		}
-		b, _ := json.MarshalIndent(defaultCfg, "", "  ")
-		_ = os.WriteFile(configPath, b, 0644)
-		return defaultCfg, nil
+		cfg := defaultConfig()
+		b, _ := json.MarshalIndent(cfg, "", "  ")
+		_ = os.WriteFile(path, b, 0644)
+		return cfg, nil
 	}
 	defer f.Close()
 	var cfg Config
 	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
 		return nil, err
 	}
+	if cfg.Port == 0 {
+		cfg.Port = 8081
+		b, _ := json.MarshalIndent(cfg, "", "  ")
+		_ = os.WriteFile(path, b, 0644)
+	}
 	return &cfg, nil
 }
 
+var (
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for development
+		},
+	}
+	clients    = make(map[*websocket.Conn]bool)
+	clientsMux sync.Mutex
+)
+
+func broadcast(data []byte) {
+	clientsMux.Lock()
+	defer clientsMux.Unlock()
+	for c := range clients {
+		err := c.WriteMessage(websocket.BinaryMessage, data)
+		if err != nil {
+			c.Close()
+			delete(clients, c)
+		}
+	}
+}
+
+func startScreenShareServer(port int) {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Remoter Screen Share</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; }
+    #video-canvas { display: block; margin: 0 auto; background: #000; max-width: 100%; max-height: 100%; }
+    #status { color: white; position: absolute; top: 10px; left: 10px; }
+  </style>
+</head>
+<body>
+  <div id="status">Connecting...</div>
+  <canvas id="video-canvas"></canvas>
+  <script src="https://cdn.jsdelivr.net/npm/jsmpeg@0.2.1/jsmpeg.min.js"></script>
+  <script>
+    var canvas = document.getElementById('video-canvas');
+    var status = document.getElementById('status');
+    var url = "ws://" + location.host + "/ws";
+    
+    console.log("Connecting to:", url);
+    status.textContent = "Connecting to " + url;
+    
+    var player = new JSMpeg.Player(url, {
+      canvas: canvas, 
+      autoplay: true, 
+      audio: false,
+      onVideoDecode: function(decoder, time) {
+        status.textContent = "Live - " + decoder.width + "x" + decoder.height;
+      }
+    });
+    
+    // Check WebSocket connection
+    setTimeout(function() {
+      if (player.source && player.source.socket) {
+        if (player.source.socket.readyState === WebSocket.OPEN) {
+          status.textContent = "Connected, waiting for video...";
+        } else {
+          status.textContent = "WebSocket connection failed";
+        }
+      }
+    }, 2000);
+  </script>
+</body>
+</html>
+		`)
+	})
+
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("WebSocket upgrade error: %v", err)
+			return
+		}
+		clientsMux.Lock()
+		clients[conn] = true
+		clientsMux.Unlock()
+		log.Printf("New WebSocket client connected. Total clients: %d", len(clients))
+
+		// Handle client disconnect
+		conn.SetCloseHandler(func(code int, text string) error {
+			clientsMux.Lock()
+			delete(clients, conn)
+			clientsMux.Unlock()
+			log.Printf("Client disconnected. Total clients: %d", len(clients))
+			return nil
+		})
+	})
+
+	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" && r.Method != "PUT" {
+			http.Error(w, "Only POST/PUT allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		log.Printf("FFmpeg stream connected")
+		buf := make([]byte, 4096)
+		totalBytes := 0
+		for {
+			n, err := r.Body.Read(buf)
+			if n > 0 {
+				totalBytes += n
+				broadcast(buf[:n])
+				if totalBytes%10000 == 0 { // Log every ~10KB
+					log.Printf("Streamed %d bytes to %d clients", totalBytes, len(clients))
+				}
+			}
+			if err != nil {
+				log.Printf("Stream ended after %d bytes", totalBytes)
+				break
+			}
+		}
+		r.Body.Close()
+	})
+
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	go func() {
+		log.Printf("Remoter screen share server listening on %s", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+}
+
 func main() {
-	ip := getPrimaryIP()
-	port := "8642"
-
-	fmt.Printf("Device IP: %s\n", ip)
-	startIPBroadcastServer(ip, port)
-
-	cfg, err := loadConfig()
+	cfg, err := loadOrCreateConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	switch cfg.Mode {
-	case "vnc":
-		if err := vnc.StartVNC(cfg.Display, cfg.Res); err != nil {
-			log.Fatalf("VNC error: %v", err)
-		}
-	case "ffmpeg":
-		if err := ffmpeg.StartFFmpeg(cfg.Display, cfg.Res); err != nil {
-			log.Fatalf("FFmpeg error: %v", err)
-		}
-	default:
-		log.Fatalf("Unknown mode in config: %s", cfg.Mode)
+	started := false
+
+	if cfg.FFmpeg {
+		startScreenShareServer(cfg.Port)
+		go func() {
+			if err := ffmpeg.StartFFmpeg(cfg.Display, cfg.Res, cfg.Port); err != nil {
+				log.Fatalf("FFmpeg error: %v", err)
+			}
+		}()
+		started = true
 	}
 
-	select {} // Keep running
-}
-	// Start panel (tint2) for taskbar and app launcher
-	cmd3 := exec.Command("tint2")
-	cmd3.Env = append(os.Environ(), "DISPLAY="+display)
-	if err := cmd3.Start(); err != nil {
-		fmt.Printf("Warning: Failed to start panel: %v\n", err)
+	if cfg.VNC {
+		go func() {
+			if err := vnc.StartVNC(cfg.Display, cfg.Res); err != nil {
+				log.Fatalf("VNC error: %v", err)
+			}
+		}()
+		started = true
 	}
 
-	// Start a terminal with the wrapper script that sets DISPLAY permanently
-	cmd4 := exec.Command(xtermPath)
-	cmd4.Env = append(os.Environ(), "DISPLAY="+display)
-	if err := cmd4.Start(); err != nil {
-		fmt.Printf("Warning: Failed to start terminal: %v\n", err)
-	}
-
-	return nil
-}
-
-func main() {
-	ip := getPrimaryIP()
-	port := "8642"
-	display := ":1"
-	res := "1920x1080x24"
-
-	fmt.Printf("Device IP: %s\n", ip)
-	startIPBroadcastServer(ip, port)
-
-	// Ensure dependencies
-	for _, pkg := range []string{"x11vnc", "xvfb", "openbox", "pcmanfm", "xterm", "tint2"} {
-		if err := ensureInstalled(pkg); err != nil {
-			log.Fatalf("Failed to install %s: %v", pkg, err)
-		}
-	}
-
-	// Start Xvfb
-	if err := startXvfb(display, res); err != nil {
-		log.Fatalf("Failed to start Xvfb: %v", err)
-	}
-	time.Sleep(2 * time.Second) // Give Xvfb time to initialize
-
-	// Start desktop environment
-	if err := startDesktop(display); err != nil {
-		log.Fatalf("Failed to start desktop: %v", err)
-	}
-	time.Sleep(2 * time.Second) // Give desktop time to initialize
-
-	// Start x11vnc
-	if err := startX11vnc(display); err != nil {
-		log.Fatalf("Failed to start x11vnc: %v", err)
+	if !started {
+		fmt.Println("No screen sharing service enabled in config. Edit ~/.remoter.json to enable VNC and/or FFmpeg.")
+		return
 	}
 
 	select {} // Keep running
