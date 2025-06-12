@@ -12,10 +12,11 @@ import (
 )
 
 type Config struct {
-	VNC     bool   `json:"vnc"`
-	FFmpeg  bool   `json:"ffmpeg"`
-	Display string `json:"display"`
-	Res     string `json:"res"`
+	VNC       bool   `json:"vnc"`
+	FFmpeg    bool   `json:"ffmpeg"`
+	Display   string `json:"display"`
+	Res       string `json:"res"`
+	Framerate int    `json:"framerate"` // New field
 }
 
 func getScreenInfo(display string) (string, string, error) {
@@ -69,6 +70,12 @@ func loadConfig() (*Config, error) {
 	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
 		return nil, err
 	}
+	// Set default framerate if missing or zero
+	if cfg.Framerate == 0 {
+		cfg.Framerate = 25
+		b, _ := json.MarshalIndent(cfg, "", "  ")
+		_ = os.WriteFile(path, b, 0644)
+	}
 	return &cfg, nil
 }
 
@@ -108,8 +115,14 @@ func StartFFmpeg(display, res string, port int) error {
 		depth = "24"
 	}
 
-	// Update config if needed
+	// Load config to get framerate
 	cfg, err := loadConfig()
+	framerate := 25
+	if err == nil {
+		framerate = cfg.Framerate
+	}
+
+	// Update config if needed
 	if err == nil {
 		updated := false
 		if cfg.Res != fmt.Sprintf("%sx%s", strings.Split(actualRes, "x")[0], strings.Split(actualRes, "x")[1])+"x"+depth {
@@ -127,11 +140,11 @@ func StartFFmpeg(display, res string, port int) error {
 
 	// The display argument is already configurable via config and passed to FFmpeg.
 
-	// Compose ffmpeg command with supported framerate for MPEG1
+	// Compose ffmpeg command with configurable framerate
 	url := fmt.Sprintf("http://localhost:%d/stream", port)
 	ffmpegArgs := []string{
 		"-video_size", actualRes,
-		"-framerate", "25", // <-- Use 25 instead of 15
+		"-framerate", fmt.Sprintf("%d", framerate),
 		"-f", "x11grab",
 		"-i", display,
 		"-vcodec", "mpeg1video",
@@ -144,5 +157,11 @@ func StartFFmpeg(display, res string, port int) error {
 	cmd := exec.Command("ffmpeg", ffmpegArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+
+	// Print error if FFmpeg fails to start
+	err = cmd.Run()
+	if err != nil {
+		fmt.Printf("FFmpeg exited with error: %v\n", err)
+	}
+	return err
 }
