@@ -1,14 +1,25 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
+	"os/user"
+	"path/filepath"
 	"time"
+
+	"github.com/nathfavour/remoter/ffmpeg"
+	"github.com/nathfavour/remoter/vnc"
 )
+
+type Config struct {
+	Mode    string `json:"mode"`    // "vnc" or "ffmpeg"
+	Display string `json:"display"` // e.g. ":1"
+	Res     string `json:"res"`     // e.g. "1920x1080x24"
+}
 
 func getPrimaryIP() string {
 	ifaces, err := net.Interfaces()
@@ -51,70 +62,59 @@ func startIPBroadcastServer(ip string, port string) {
 	}()
 }
 
-func ensureInstalled(pkg string) error {
-	cmd := exec.Command("which", pkg)
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Installing %s...\n", pkg)
-		install := exec.Command("sudo", "apt", "install", "-y", pkg)
-		install.Stdout = os.Stdout
-		install.Stderr = os.Stderr
-		return install.Run()
+func loadConfig() (*Config, error) {
+	usr, err := user.Current()
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	configPath := filepath.Join(usr.HomeDir, ".remoter.json")
+	f, err := os.Open(configPath)
+	if err != nil {
+		// Create default config if not exists
+		defaultCfg := &Config{
+			Mode:    "vnc",
+			Display: ":1",
+			Res:     "1920x1080x24",
+		}
+		b, _ := json.MarshalIndent(defaultCfg, "", "  ")
+		_ = os.WriteFile(configPath, b, 0644)
+		return defaultCfg, nil
+	}
+	defer f.Close()
+	var cfg Config
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
-func startXvfb(display, res string) error {
-	cmd := exec.Command("pgrep", "-f", "Xvfb "+display)
-	if err := cmd.Run(); err != nil {
-		fmt.Println("Starting Xvfb...")
-		return exec.Command("Xvfb", display, "-screen", "0", res).Start()
+func main() {
+	ip := getPrimaryIP()
+	port := "8642"
+
+	fmt.Printf("Device IP: %s\n", ip)
+	startIPBroadcastServer(ip, port)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
-	return nil
+
+	switch cfg.Mode {
+	case "vnc":
+		if err := vnc.StartVNC(cfg.Display, cfg.Res); err != nil {
+			log.Fatalf("VNC error: %v", err)
+		}
+	case "ffmpeg":
+		if err := ffmpeg.StartFFmpeg(cfg.Display, cfg.Res); err != nil {
+			log.Fatalf("FFmpeg error: %v", err)
+		}
+	default:
+		log.Fatalf("Unknown mode in config: %s", cfg.Mode)
+	}
+
+	select {} // Keep running
 }
-
-func startX11vnc(display string) error {
-	fmt.Println("Starting x11vnc...")
-	return exec.Command("x11vnc", "-display", display, "-forever").Start()
-}
-
-func startDesktop(display string) error {
-	fmt.Println("Starting desktop environment...")
-
-	// Create a profile script that sets DISPLAY permanently for the session
-	profileScript := `export DISPLAY=` + display + `
-export XAUTHORITY=/tmp/.X` + display[1:] + `-auth
-`
-	profilePath := "/tmp/vnc_profile"
-	if err := os.WriteFile(profilePath, []byte(profileScript), 0644); err != nil {
-		return err
-	}
-
-	// Create a wrapper script for xterm that sources the profile
-	xtermScript := `#!/bin/bash
-source /tmp/vnc_profile
-exec xterm -e "bash --rcfile /tmp/vnc_profile"
-`
-	xtermPath := "/tmp/vnc_xterm.sh"
-	if err := os.WriteFile(xtermPath, []byte(xtermScript), 0755); err != nil {
-		return err
-	}
-
-	// Start window manager (openbox) with proper environment
-	cmd1 := exec.Command("openbox")
-	cmd1.Env = append(os.Environ(), "DISPLAY="+display)
-	if err := cmd1.Start(); err != nil {
-		return err
-	}
-
-	time.Sleep(1 * time.Second)
-
-	// Start file manager
-	cmd2 := exec.Command("pcmanfm", "--desktop")
-	cmd2.Env = append(os.Environ(), "DISPLAY="+display)
-	if err := cmd2.Start(); err != nil {
-		fmt.Printf("Warning: Failed to start file manager: %v\n", err)
-	}
-
 	// Start panel (tint2) for taskbar and app launcher
 	cmd3 := exec.Command("tint2")
 	cmd3.Env = append(os.Environ(), "DISPLAY="+display)
